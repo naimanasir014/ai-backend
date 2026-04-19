@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+pillow
+pytesseract
+python-dotenv
+
+groq==0.4.1
+httpx==0.24.1
