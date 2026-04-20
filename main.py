@@ -172,4 +172,4 @@ async def recommend_jobs(data: dict = Body(...)):
 
 @app.get("/")
 def home():
-    return {"message": "Backend Running ✅"}
+    return {"message": "Backend Running ✅"} 
