@@ -11,7 +11,7 @@ from io import BytesIO
 
 from groq import Groq
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from PIL import Image
@@ -176,12 +176,8 @@ async def verify_front_id(front_id: UploadFile = File(...)):
         valid, reason = is_valid_image(front_path)
         if not valid:
             return JSONResponse(content={"status": "failed", "reason": reason})
-        img_rgb = load_image_rgb(front_path)
-        encoding, error = get_face_encoding(img_rgb, "ID card")
-        if encoding is None:
-            return JSONResponse(content={"status": "failed", "reason": "No face found on ID card. Ensure the front of your ID with your photo is clearly visible."})
-        logger.info("Front ID validated — face found.")
-        return JSONResponse(content={"status": "verified", "message": "Front ID is valid."})
+        logger.info("Front ID image accepted.")
+        return JSONResponse(content={"status": "verified", "message": "Front ID accepted."})
     except Exception as e:
         logger.error(f"/verify-front-id error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -250,10 +246,11 @@ async def verify_id(
 # ==============================
 
 @app.post("/recommend-jobs")
-async def recommend_jobs(request: dict):
+async def recommend_jobs(request: Request):
     try:
-        skills = request.get("skills", [])
-        jobs = request.get("jobs", [])
+        body = await request.json()
+        skills = body.get("skills", [])
+        jobs = body.get("jobs", [])
 
         if not skills:
             return JSONResponse(content={"status": "failed", "reason": "No skills provided."})
@@ -350,6 +347,5 @@ Rules:
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8000)) 
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
-    
