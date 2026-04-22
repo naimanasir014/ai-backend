@@ -1,4 +1,4 @@
-print("🔥 MCQ SERVER RUNNING 🔥") 
+print("🔥 MCQ SERVER RUNNING 🔥")
 
 import os
 import uuid
@@ -115,25 +115,44 @@ def is_valid_image(path: Path) -> tuple:
     if not path.exists():
         return False, "File not found."
     size_kb = path.stat().st_size / 1024
-    if size_kb < 15:
+    if size_kb < 5:
         return False, f"Image too small ({size_kb:.1f}KB). Please retake clearly."
     try:
         img = load_image_rgb(path)
         h, w = img.shape[:2]
-        if w < 100 or h < 100:
+        if w < 80 or h < 80:
             return False, f"Image resolution too low ({w}x{h})."
         return True, "ok"
     except Exception as e:
         return False, f"Cannot read image: {str(e)}"
 
 
+def preprocess_for_id(image_rgb: np.ndarray) -> np.ndarray:
+    h, w = image_rgb.shape[:2]
+    if w < 1200:
+        scale = 1200 / w
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        image_rgb = cv2.resize(image_rgb, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    sharpened = cv2.filter2D(bgr, -1, kernel)
+    return cv2.cvtColor(sharpened, cv2.COLOR_BGR2RGB)
+
+
 def get_face_encoding(image_rgb: np.ndarray, label: str = "image"):
-    face_locations = face_recognition.face_locations(image_rgb, model="hog")
+    processed = preprocess_for_id(image_rgb)
+    for upsample in [2, 1, 0]:
+        face_locations = face_recognition.face_locations(
+            processed, number_of_times_to_upsample=upsample, model="hog"
+        )
+        if len(face_locations) > 0:
+            break
     if len(face_locations) == 0:
         return None, f"No face detected in {label}."
     if len(face_locations) > 1:
         face_locations = [max(face_locations, key=lambda loc: (loc[2] - loc[0]) * (loc[1] - loc[3]))]
-    encodings = face_recognition.face_encodings(image_rgb, face_locations)
+    encodings = face_recognition.face_encodings(processed, face_locations, num_jitters=2)
     if len(encodings) == 0:
         return None, f"Could not encode face in {label}."
     return encodings[0], None
@@ -333,3 +352,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    
