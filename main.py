@@ -1,24 +1,43 @@
-print("🔥 MCQ SERVER RUNNING 🔥")
+print("🔥 MCQ SERVER RUNNING 🔥") 
 
 import os
-from groq import Groq
-from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile
-from pydantic import BaseModel
-from PIL import Image
+import uuid
+import shutil
+import logging
+import json
+from pathlib import Path
+from typing import Optional
 from io import BytesIO
 
-# 🔥 LOAD ENV
+from groq import Groq
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from PIL import Image
+import cv2
+import numpy as np
+import face_recognition
+
+# LOAD ENV
 load_dotenv()
 
-client = Groq(
-    api_key=os.getenv("GROQ_API_KEY")
-)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("id-verify")
 
-app = FastAPI()
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+FACE_MATCH_TOLERANCE = 0.50
+
+# Groq client
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+app = FastAPI(title="AI Backend", version="4.0")
+
 
 # ==============================
-# 🔥 MCQ SECTION (UNCHANGED)
+# MCQ SECTION (UNCHANGED)
 # ==============================
 
 class QueryRequest(BaseModel):
@@ -47,9 +66,7 @@ def generate_mcqs(query):
             temperature=0.3,
             max_tokens=1500
         )
-
         return completion.choices[0].message.content
-
     except Exception as e:
         return f"ERROR: {str(e)}"
 
@@ -62,114 +79,257 @@ def chat_endpoint(request: QueryRequest):
 
 
 # ==============================
-# 🔥 FINAL ID VERIFICATION API (FIXED)
+# ID VERIFICATION SECTION
 # ==============================
+
+def save_upload(upload: UploadFile, suffix: str = ".jpg") -> Path:
+    filename = f"{uuid.uuid4().hex}{suffix}"
+    dest = UPLOAD_DIR / filename
+    with dest.open("wb") as f:
+        shutil.copyfileobj(upload.file, f)
+    logger.info(f"Saved: {dest} ({dest.stat().st_size} bytes)")
+    return dest
+
+
+def cleanup(*paths):
+    for p in paths:
+        try:
+            if p and Path(p).exists():
+                Path(p).unlink()
+        except Exception as e:
+            logger.warning(f"Cleanup error: {e}")
+
+
+def load_image_rgb(path: Path) -> np.ndarray:
+    try:
+        pil_img = Image.open(path).convert("RGB")
+        return np.array(pil_img)
+    except Exception:
+        img_bgr = cv2.imread(str(path))
+        if img_bgr is None:
+            raise ValueError(f"Cannot read image: {path}")
+        return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+
+def is_valid_image(path: Path) -> tuple:
+    if not path.exists():
+        return False, "File not found."
+    size_kb = path.stat().st_size / 1024
+    if size_kb < 15:
+        return False, f"Image too small ({size_kb:.1f}KB). Please retake clearly."
+    try:
+        img = load_image_rgb(path)
+        h, w = img.shape[:2]
+        if w < 100 or h < 100:
+            return False, f"Image resolution too low ({w}x{h})."
+        return True, "ok"
+    except Exception as e:
+        return False, f"Cannot read image: {str(e)}"
+
+
+def get_face_encoding(image_rgb: np.ndarray, label: str = "image"):
+    face_locations = face_recognition.face_locations(image_rgb, model="hog")
+    if len(face_locations) == 0:
+        return None, f"No face detected in {label}."
+    if len(face_locations) > 1:
+        face_locations = [max(face_locations, key=lambda loc: (loc[2] - loc[0]) * (loc[1] - loc[3]))]
+    encodings = face_recognition.face_encodings(image_rgb, face_locations)
+    if len(encodings) == 0:
+        return None, f"Could not encode face in {label}."
+    return encodings[0], None
+
+
+@app.get("/")
+def root():
+    return {"status": "online", "service": "AI Backend v4"}
+
+
+@app.get("/ping")
+def ping():
+    return {"status": "alive"}
+
+
+@app.post("/verify-front-id")
+async def verify_front_id(front_id: UploadFile = File(...)):
+    front_path = None
+    try:
+        front_path = save_upload(front_id, ".jpg")
+        valid, reason = is_valid_image(front_path)
+        if not valid:
+            return JSONResponse(content={"status": "failed", "reason": reason})
+        img_rgb = load_image_rgb(front_path)
+        encoding, error = get_face_encoding(img_rgb, "ID card")
+        if encoding is None:
+            return JSONResponse(content={"status": "failed", "reason": "No face found on ID card. Ensure the front of your ID with your photo is clearly visible."})
+        logger.info("Front ID validated — face found.")
+        return JSONResponse(content={"status": "verified", "message": "Front ID is valid."})
+    except Exception as e:
+        logger.error(f"/verify-front-id error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cleanup(front_path)
+
 
 @app.post("/verify-id")
 async def verify_id(
-    id_card: UploadFile = File(...),
-    selfie: UploadFile = File(...)
+    selfie: UploadFile = File(...),
+    front_id: UploadFile = File(...),
+    back_id: Optional[UploadFile] = File(None),
 ):
+    selfie_path = None
+    front_path = None
+    back_path = None
     try:
-        # 🔥 READ FILES
-        id_bytes = await id_card.read()
-        selfie_bytes = await selfie.read()
+        selfie_path = save_upload(selfie, ".jpg")
+        front_path = save_upload(front_id, ".jpg")
+        if back_id and back_id.filename:
+            back_path = save_upload(back_id, ".jpg")
 
-        # 🔥 BASIC VALIDATION
-        if not id_bytes or not selfie_bytes:
-            return {
-                "status": "error",
-                "message": "Images not received"
-            }
+        for path, label in [(selfie_path, "selfie"), (front_path, "front ID")]:
+            valid, reason = is_valid_image(path)
+            if not valid:
+                return JSONResponse(content={"status": "failed", "reason": f"{label.capitalize()} issue: {reason}"})
 
-        # ==============================
-        # 🔥 SIMPLIFIED TEXT (NO OCR)
-        # ==============================
+        selfie_rgb = load_image_rgb(selfie_path)
+        selfie_encoding, _ = get_face_encoding(selfie_rgb, "selfie")
+        if selfie_encoding is None:
+            return JSONResponse(content={"status": "failed", "reason": "No face detected in selfie. Ensure your face is fully visible, well-lit, and centered."})
 
-        text = "Sample ID Text"
+        front_rgb = load_image_rgb(front_path)
+        id_encoding, _ = get_face_encoding(front_rgb, "ID card")
+        if id_encoding is None:
+            return JSONResponse(content={"status": "failed", "reason": "No face found on ID card. Ensure the front side with your photo is clearly visible."})
 
-        # ==============================
-        # 🔥 FACE MATCH (SIMULATED)
-        # ==============================
+        distance = face_recognition.face_distance([id_encoding], selfie_encoding)[0]
+        matched = bool(distance <= FACE_MATCH_TOLERANCE)
 
-        print("⚠️ Face recognition skipped (Railway safe mode)")
-        match = True
+        logger.info(f"Face distance: {distance:.4f} | Match: {matched}")
 
-        # ==============================
-        # 🔥 AI CHECK (UNCHANGED)
-        # ==============================
+        if distance < 0.35:
+            confidence = "very_high"
+        elif distance < 0.45:
+            confidence = "high"
+        elif distance < FACE_MATCH_TOLERANCE:
+            confidence = "medium"
+        else:
+            confidence = "low"
 
-        prompt = f"""
-        Check if this ID card text is REAL or FAKE.
-
-        Text:
-        {text}
-
-        Reply ONLY:
-        REAL or FAKE
-        """
-
-        ai_response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=20
-        )
-
-        ai_result = ai_response.choices[0].message.content.strip()
-
-        return {
-            "status": "success",
-            "face_match": "match",
-            "id_status": "valid",
-            "ai_result": ai_result,
-            "extracted_text": text
-        }
+        if matched:
+            return JSONResponse(content={"status": "verified", "distance": round(float(distance), 4), "confidence": confidence, "message": "Identity verified successfully."})
+        else:
+            return JSONResponse(content={"status": "failed", "reason": "Your face does not match the ID photo. Ensure good lighting and try again.", "distance": round(float(distance), 4), "confidence": confidence})
 
     except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+        logger.error(f"/verify-id error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Verification error: {str(e)}")
+    finally:
+        cleanup(selfie_path, front_path, back_path)
 
 
 # ==============================
-# 🔥 JOB RECOMMENDER (UNCHANGED)
+# JOB RECOMMENDATION SECTION
 # ==============================
-
-from fastapi import Body
 
 @app.post("/recommend-jobs")
-async def recommend_jobs(data: dict = Body(...)):
-    skills = data.get("skills", [])
+async def recommend_jobs(request: dict):
+    try:
+        skills = request.get("skills", [])
+        jobs = request.get("jobs", [])
 
-    jobs = []
+        if not skills:
+            return JSONResponse(content={"status": "failed", "reason": "No skills provided."})
 
-    if "flutter" in skills:
-        jobs.append({
-            "title": "Flutter Developer",
-            "description": "Build mobile apps using Flutter"
+        if not jobs:
+            return JSONResponse(content={"status": "failed", "reason": "No jobs available."})
+
+        skills_str = ", ".join(skills)
+        jobs_to_evaluate = jobs[:30]
+
+        jobs_summary = []
+        for i, job in enumerate(jobs_to_evaluate):
+            jobs_summary.append(
+                f"{i}. ID:{job.get('id','?')} | Title:{job.get('title','?')} | "
+                f"Category:{job.get('category','?')} | "
+                f"Description:{str(job.get('description',''))[:150]} | "
+                f"Budget:{job.get('minBudget','?')}-{job.get('maxBudget','?')}"
+            )
+
+        jobs_text = "\n".join(jobs_summary)
+
+        prompt = f"""You are an expert job matching AI for a freelancing platform.
+
+Freelancer skills: {skills_str}
+
+Available jobs:
+{jobs_text}
+
+Task: Analyze the freelancer skills and recommend the most relevant jobs.
+Return ONLY a valid JSON array (no extra text, no markdown) like this:
+[
+  {{
+    "job_index": 0,
+    "match_score": 95,
+    "reason": "Short reason why this matches the skills"
+  }}
+]
+
+Rules:
+- Only include jobs with match_score >= 50
+- Maximum 10 jobs
+- Sort by match_score descending
+- Keep reason under 20 words
+- Return ONLY the JSON array, nothing else"""
+
+        chat_response = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+
+        ai_text = chat_response.choices[0].message.content.strip()
+        logger.info(f"Groq AI response: {ai_text}")
+
+        if "```" in ai_text:
+            ai_text = ai_text.split("```")[1]
+            if ai_text.startswith("json"):
+                ai_text = ai_text[4:]
+        ai_text = ai_text.strip()
+
+        matched = json.loads(ai_text)
+
+        recommended = []
+        for item in matched:
+            idx = item.get("job_index")
+            if idx is not None and 0 <= idx < len(jobs_to_evaluate):
+                job = dict(jobs_to_evaluate[idx])
+                job["match_score"] = item.get("match_score", 0)
+                job["reason"] = item.get("reason", "")
+                recommended.append(job)
+
+        recommended.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+
+        logger.info(f"Recommended {len(recommended)} jobs for skills: {skills_str}")
+
+        return JSONResponse(content={
+            "status": "success",
+            "recommended_jobs": recommended,
+            "total": len(recommended)
         })
 
-    if "firebase" in skills:
-        jobs.append({
-            "title": "Firebase Expert",
-            "description": "Manage backend and database"
+    except json.JSONDecodeError as e:
+        logger.error(f"AI JSON parse error: {e}")
+        return JSONResponse(content={
+            "status": "success",
+            "recommended_jobs": jobs[:10],
+            "total": len(jobs[:10])
         })
-
-    if not jobs:
-        jobs.append({
-            "title": "General Developer",
-            "description": "Work on multiple technologies"
-        })
-
-    return {"jobs": jobs}
+    except Exception as e:
+        logger.error(f"/recommend-jobs error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==============================
-# 🔥 TEST ROUTE (UNCHANGED)
-# ==============================
-
-@app.get("/")
-def home():
-    return {"message": "Backend Running ✅"} 
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
