@@ -345,7 +345,41 @@ Rules:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
+# ==============================
+# PROPOSAL GENERATION SECTION
+# ==============================
+
+class ProposalRequest(BaseModel):
+    prompt: str
+
+@app.post("/generate-proposal")
+async def generate_proposal(request: ProposalRequest):
+    try:
+        completion = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a professional freelancer who writes compelling job proposals. Write clear, concise, and persuasive proposals."
+                },
+                {
+                    "role": "user",
+                    "content": request.prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=600,
+        )
+        proposal = completion.choices[0].message.content.strip()
+        logger.info("Proposal generated successfully.")
+        return JSONResponse(content={"status": "success", "proposal": proposal})
+    except Exception as e:
+        logger.error(f"/generate-proposal error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000)) 
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
