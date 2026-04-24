@@ -261,16 +261,17 @@ async def recommend_jobs(request: Request):
         skills_str = ", ".join(skills)
         jobs_to_evaluate = jobs[:30]
 
-        jobs_summary = []
+        # Build a summary string for the AI prompt, keeping job index for reference
+        jobs_summary_lines = []
         for i, job in enumerate(jobs_to_evaluate):
-            jobs_summary.append(
-                f"{i}. ID:{job.get('id','?')} | Title:{job.get('title','?')} | "
-                f"Category:{job.get('category','?')} | "
-                f"Description:{str(job.get('description',''))[:150]} | "
-                f"Budget:{job.get('minBudget','?')}-{job.get('maxBudget','?')}"
+            jobs_summary_lines.append(
+                f"{i}. ID:{job.get('id', '?')} | Title:{job.get('title', '?')} | "
+                f"Category:{job.get('category', '?')} | "
+                f"Description:{str(job.get('description', ''))[:150]} | "
+                f"Budget:{job.get('minBudget', '?')}-{job.get('maxBudget', '?')}"
             )
 
-        jobs_text = "\n".join(jobs_summary)
+        jobs_text = "\n".join(jobs_summary_lines)
 
         prompt = f"""You are an expert job matching AI for a freelancing platform.
 
@@ -280,7 +281,7 @@ Available jobs:
 {jobs_text}
 
 Task: Analyze the freelancer skills and recommend the most relevant jobs.
-Return ONLY a valid JSON array (no extra text, no markdown) like this:
+Return ONLY a valid JSON array (no extra text, no markdown, no code fences) like this:
 [
   {{
     "job_index": 0,
@@ -304,25 +305,33 @@ Rules:
         )
 
         ai_text = chat_response.choices[0].message.content.strip()
-        logger.info(f"Groq AI response: {ai_text}")
+        logger.info(f"Groq AI raw response: {ai_text}")
 
+        # Strip markdown code fences if present
         if "```" in ai_text:
-            ai_text = ai_text.split("```")[1]
+            parts = ai_text.split("```")
+            # Take the content inside the first code block
+            ai_text = parts[1] if len(parts) > 1 else parts[0]
             if ai_text.startswith("json"):
                 ai_text = ai_text[4:]
         ai_text = ai_text.strip()
 
         matched = json.loads(ai_text)
 
+        # ── KEY FIX ──
+        # Rebuild each result using the original job dict (which has the real Firestore id)
+        # and attach match_score + reason from AI on top.
         recommended = []
         for item in matched:
             idx = item.get("job_index")
-            if idx is not None and 0 <= idx < len(jobs_to_evaluate):
-                job = dict(jobs_to_evaluate[idx])
-                job["match_score"] = item.get("match_score", 0)
-                job["reason"] = item.get("reason", "")
-                recommended.append(job)
+            if idx is None or not (0 <= idx < len(jobs_to_evaluate)):
+                continue
+            job = dict(jobs_to_evaluate[idx])          # copy original job (includes 'id')
+            job["match_score"] = int(item.get("match_score", 0))
+            job["reason"] = item.get("reason", "")
+            recommended.append(job)
 
+        # Sort descending by match_score (AI should already do this, but be safe)
         recommended.sort(key=lambda x: x.get("match_score", 0), reverse=True)
 
         logger.info(f"Recommended {len(recommended)} jobs for skills: {skills_str}")
@@ -330,21 +339,25 @@ Rules:
         return JSONResponse(content={
             "status": "success",
             "recommended_jobs": recommended,
-            "total": len(recommended)
+            "total": len(recommended),
         })
 
     except json.JSONDecodeError as e:
-        logger.error(f"AI JSON parse error: {e}")
+        # AI returned malformed JSON → return top 10 jobs as fallback with score 0
+        logger.error(f"AI JSON parse error: {e}. Raw text: {ai_text if 'ai_text' in dir() else 'N/A'}")
+        fallback = [dict(j) for j in jobs[:10]]
+        for j in fallback:
+            j["match_score"] = 0
+            j["reason"] = "Keyword-based fallback"
         return JSONResponse(content={
             "status": "success",
-            "recommended_jobs": jobs[:10],
-            "total": len(jobs[:10])
+            "recommended_jobs": fallback,
+            "total": len(fallback),
         })
+
     except Exception as e:
         logger.error(f"/recommend-jobs error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-
 
 
 # ==============================
@@ -378,6 +391,7 @@ async def generate_proposal(request: ProposalRequest):
     except Exception as e:
         logger.error(f"/generate-proposal error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
