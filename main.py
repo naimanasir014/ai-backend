@@ -19,6 +19,10 @@ import cv2
 import numpy as np
 import face_recognition
 
+# ── NEW: Firebase Admin ──
+import firebase_admin
+from firebase_admin import credentials, firestore, messaging
+
 # LOAD ENV
 load_dotenv()
 
@@ -34,6 +38,161 @@ FACE_MATCH_TOLERANCE = 0.50
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 app = FastAPI(title="AI Backend", version="4.0")
+
+
+# ==============================
+# FIREBASE ADMIN INIT
+# ==============================
+
+# Put your Firebase service account JSON file in the same folder as main.py
+# and name it: serviceAccountKey.json
+# Download it from: Firebase Console → Project Settings → Service Accounts → Generate new private key
+
+SERVICE_ACCOUNT_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT", "serviceAccountKey.json")
+
+if not firebase_admin._apps:
+    try:
+        cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+        firebase_admin.initialize_app(cred)
+        logger.info("✅ Firebase Admin initialized successfully.")
+    except Exception as e:
+        logger.error(f"❌ Firebase Admin init failed: {e}")
+
+db = firestore.client()
+
+
+# ==============================
+# HELPER: Save notification to Firestore + Send FCM push
+# ==============================
+
+async def send_notification(
+    user_id: str,
+    sender_id: str,
+    notification_type: str,
+    title: str,
+    message: str,
+    job_id: str = "",
+    proposal_id: str = "",
+):
+    """
+    1. Saves notification document to Firestore (for in-app bell)
+    2. Sends FCM push notification to device (for popup even when app closed)
+    """
+    try:
+        # 1. Save to Firestore notifications collection
+        db.collection("notifications").add({
+            "userId": user_id,
+            "senderId": sender_id,
+            "type": notification_type,
+            "title": title,
+            "message": message,
+            "jobId": job_id,
+            "proposalId": proposal_id,
+            "read": False,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+        })
+        logger.info(f"✅ Notification saved to Firestore for user: {user_id}")
+
+        # 2. Get user's FCM token from Firestore users collection
+        user_doc = db.collection("users").document(user_id).get()
+        if not user_doc.exists:
+            logger.warning(f"User document not found: {user_id}")
+            return
+
+        user_data = user_doc.to_dict()
+        fcm_token = user_data.get("fcmToken")  # Make sure Flutter saves this field
+
+        if not fcm_token:
+            logger.warning(f"No FCM token for user: {user_id}")
+            return
+
+        # 3. Send FCM push notification
+        fcm_message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=message,
+            ),
+            data={
+                "type": notification_type,
+                "jobId": job_id,
+                "proposalId": proposal_id,
+                "click_action": "FLUTTER_NOTIFICATION_CLICK",
+            },
+            token=fcm_token,
+        )
+
+        response = messaging.send(fcm_message)
+        logger.info(f"✅ FCM push sent: {response}")
+
+    except Exception as e:
+        logger.error(f"❌ send_notification error: {e}", exc_info=True)
+
+
+# ==============================
+# NOTIFICATION ENDPOINTS
+# ==============================
+
+class NewProposalNotificationRequest(BaseModel):
+    clientId: str
+    freelancerId: str
+    freelancerName: str
+    jobId: str
+    jobTitle: str
+    proposalId: str = ""
+
+
+class ProposalStatusNotificationRequest(BaseModel):
+    freelancerId: str
+    clientId: str
+    jobId: str
+    jobTitle: str
+    status: str       # "accepted" or "rejected"
+    proposalId: str = ""
+
+
+@app.post("/notify/new-proposal")
+async def notify_new_proposal(req: NewProposalNotificationRequest):
+    """
+    Called when a freelancer submits a proposal.
+    Notifies the CLIENT.
+    """
+    try:
+        await send_notification(
+            user_id=req.clientId,
+            sender_id=req.freelancerId,
+            notification_type="new_proposal",
+            title="New Proposal Received 📨",
+            message=f"{req.freelancerName} submitted a proposal on \"{req.jobTitle}\"",
+            job_id=req.jobId,
+            proposal_id=req.proposalId,
+        )
+        return JSONResponse(content={"status": "success", "message": "Client notified."})
+    except Exception as e:
+        logger.error(f"/notify/new-proposal error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/notify/proposal-status")
+async def notify_proposal_status(req: ProposalStatusNotificationRequest):
+    """
+    Called when a client accepts or rejects a proposal.
+    Notifies the FREELANCER.
+    """
+    try:
+        accepted = req.status == "accepted"
+        await send_notification(
+            user_id=req.freelancerId,
+            sender_id=req.clientId,
+            notification_type="proposal_accepted" if accepted else "proposal_rejected",
+            title="Proposal Accepted 🎉" if accepted else "Proposal Rejected",
+            message=f"Your proposal on \"{req.jobTitle}\" was {req.status}",
+            job_id=req.jobId,
+            proposal_id=req.proposalId,
+        )
+        return JSONResponse(content={"status": "success", "message": "Freelancer notified."})
+    except Exception as e:
+        logger.error(f"/notify/proposal-status error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==============================
@@ -79,7 +238,7 @@ def chat_endpoint(request: QueryRequest):
 
 
 # ==============================
-# ID VERIFICATION SECTION
+# ID VERIFICATION SECTION (UNCHANGED)
 # ==============================
 
 def save_upload(upload: UploadFile, suffix: str = ".jpg") -> Path:
@@ -242,7 +401,7 @@ async def verify_id(
 
 
 # ==============================
-# JOB RECOMMENDATION SECTION
+# JOB RECOMMENDATION SECTION (UNCHANGED)
 # ==============================
 
 @app.post("/recommend-jobs")
@@ -261,7 +420,6 @@ async def recommend_jobs(request: Request):
         skills_str = ", ".join(skills)
         jobs_to_evaluate = jobs[:30]
 
-        # Build a summary string for the AI prompt, keeping job index for reference
         jobs_summary_lines = []
         for i, job in enumerate(jobs_to_evaluate):
             jobs_summary_lines.append(
@@ -307,10 +465,8 @@ Rules:
         ai_text = chat_response.choices[0].message.content.strip()
         logger.info(f"Groq AI raw response: {ai_text}")
 
-        # Strip markdown code fences if present
         if "```" in ai_text:
             parts = ai_text.split("```")
-            # Take the content inside the first code block
             ai_text = parts[1] if len(parts) > 1 else parts[0]
             if ai_text.startswith("json"):
                 ai_text = ai_text[4:]
@@ -318,20 +474,16 @@ Rules:
 
         matched = json.loads(ai_text)
 
-        # ── KEY FIX ──
-        # Rebuild each result using the original job dict (which has the real Firestore id)
-        # and attach match_score + reason from AI on top.
         recommended = []
         for item in matched:
             idx = item.get("job_index")
             if idx is None or not (0 <= idx < len(jobs_to_evaluate)):
                 continue
-            job = dict(jobs_to_evaluate[idx])          # copy original job (includes 'id')
+            job = dict(jobs_to_evaluate[idx])
             job["match_score"] = int(item.get("match_score", 0))
             job["reason"] = item.get("reason", "")
             recommended.append(job)
 
-        # Sort descending by match_score (AI should already do this, but be safe)
         recommended.sort(key=lambda x: x.get("match_score", 0), reverse=True)
 
         logger.info(f"Recommended {len(recommended)} jobs for skills: {skills_str}")
@@ -343,8 +495,7 @@ Rules:
         })
 
     except json.JSONDecodeError as e:
-        # AI returned malformed JSON → return top 10 jobs as fallback with score 0
-        logger.error(f"AI JSON parse error: {e}. Raw text: {ai_text if 'ai_text' in dir() else 'N/A'}")
+        logger.error(f"AI JSON parse error: {e}")
         fallback = [dict(j) for j in jobs[:10]]
         for j in fallback:
             j["match_score"] = 0
@@ -361,7 +512,7 @@ Rules:
 
 
 # ==============================
-# PROPOSAL GENERATION SECTION
+# PROPOSAL GENERATION SECTION (UNCHANGED)
 # ==============================
 
 class ProposalRequest(BaseModel):
