@@ -14,4 +14,3 @@ face-recognition
 firebase-admin
 stripe
 anthropic
-
