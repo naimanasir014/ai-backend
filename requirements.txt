@@ -12,4 +12,6 @@ pydantic
 opencv-python-headless
 face-recognition 
 firebase-admin
+stripe
+anthropic
 
