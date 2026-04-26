@@ -23,7 +23,9 @@ import face_recognition
 import firebase_admin
 from firebase_admin import credentials, firestore, messaging
 
+# ══════════════════════════════════════════════════════════════
 # LOAD ENV
+# ══════════════════════════════════════════════════════════════
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -34,42 +36,94 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 FACE_MATCH_TOLERANCE = 0.50
 
-# Groq client (MCQ / proposals / job matching)
+# Groq client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # Anthropic (chatbot)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_URL     = "https://api.anthropic.com/v1/messages"
 
-# ✅ STRIPE — correctly reads from .env (sk_test_xxx)
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
+# Stripe
+stripe.api_key        = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
 app = FastAPI(title="AI Backend", version="5.0")
 
+# ══════════════════════════════════════════════════════════════
+# ✅ FIREBASE ADMIN INIT — FIXED
+# ══════════════════════════════════════════════════════════════
+db = None  # ✅ Start as None — set after successful init
 
-# ==============================
-# FIREBASE ADMIN INIT
-# ==============================
+def _init_firebase():
+    """
+    Initialize Firebase Admin SDK.
+    Supports both:
+      - Local: serviceAccountKey.json file on disk
+      - Railway: FIREBASE_SERVICE_ACCOUNT env var with JSON string
+    """
+    global db
 
-SERVICE_ACCOUNT_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT", "serviceAccountKey.json")
+    if firebase_admin._apps:
+        db = firestore.client()
+        logger.info("✅ Firebase already initialized.")
+        return True
 
-if not firebase_admin._apps:
-    try:
+    # Option 1: JSON string in environment variable (Railway)
+    service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+    if service_account_json:
+        try:
+            service_account_info = json.loads(service_account_json)
+            cred = credentials.Certificate(service_account_info)
+            firebase_admin.initialize_app(cred)
+            db = firestore.client()
+            logger.info("✅ Firebase initialized from FIREBASE_SERVICE_ACCOUNT_JSON env var.")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Firebase init from env JSON failed: {e}")
 
-        cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
-        firebase_admin.initialize_app(cred)
-        logger.info("✅ Firebase Admin initialized successfully.")
-    except Exception as e:
-        logger.error(f"❌ Firebase Admin init failed: {e}")
+    # Option 2: Path to JSON file (local development)
+    service_account_path = os.getenv("FIREBASE_SERVICE_ACCOUNT", "serviceAccountKey.json")
+    if os.path.exists(service_account_path):
+        try:
+            cred = credentials.Certificate(service_account_path)
+            firebase_admin.initialize_app(cred)
+            db = firestore.client()
+            logger.info(f"✅ Firebase initialized from file: {service_account_path}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Firebase init from file failed: {e}")
 
-db = firestore.client()
+    logger.error(
+        "❌ Firebase NOT initialized. "
+        "Set FIREBASE_SERVICE_ACCOUNT_JSON in Railway or place serviceAccountKey.json locally."
+    )
+    return False
 
 
-# ==============================
+# ✅ Initialize Firebase on startup
+_init_firebase()
+
+
+# ══════════════════════════════════════════════════════════════
+# HELPER: Get DB safely
+# ══════════════════════════════════════════════════════════════
+def get_db():
+    """Returns Firestore client, retries init if not ready."""
+    global db
+    if db is None:
+        logger.warning("⚠️ Firestore not ready, retrying init...")
+        _init_firebase()
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Firebase not initialized. Check FIREBASE_SERVICE_ACCOUNT_JSON in Railway."
+        )
+    return db
+
+
+# ══════════════════════════════════════════════════════════════
 # HELPER: Firestore notification + FCM push
-# ==============================
-
+# ══════════════════════════════════════════════════════════════
 async def send_notification(
     user_id: str,
     sender_id: str,
@@ -80,7 +134,8 @@ async def send_notification(
     proposal_id: str = "",
 ):
     try:
-        db.collection("notifications").add({
+        _db = get_db()
+        _db.collection("notifications").add({
             "userId":     user_id,
             "senderId":   sender_id,
             "type":       notification_type,
@@ -88,12 +143,12 @@ async def send_notification(
             "message":    message,
             "jobId":      job_id,
             "proposalId": proposal_id,
-            "read":       False,
+            "isRead":     False,
             "createdAt":  firestore.SERVER_TIMESTAMP,
         })
-        logger.info(f"✅ Notification saved to Firestore for user: {user_id}")
+        logger.info(f"✅ Notification saved for user: {user_id}")
 
-        user_doc = db.collection("users").document(user_id).get()
+        user_doc = _db.collection("users").document(user_id).get()
         if not user_doc.exists:
             logger.warning(f"User document not found: {user_id}")
             return
@@ -116,12 +171,13 @@ async def send_notification(
         response = messaging.send(fcm_msg)
         logger.info(f"✅ FCM push sent: {response}")
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ send_notification error: {e}", exc_info=True)
 
 
 async def _push_fcm(token: str, title: str, body: str, data: dict | None = None):
-    """Lightweight FCM push used by the chatbot."""
     try:
         msg = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
@@ -134,10 +190,28 @@ async def _push_fcm(token: str, title: str, body: str, data: dict | None = None)
         logger.error(f"❌ FCM (chatbot) error: {e}")
 
 
-# ==============================
-# NOTIFICATION ENDPOINTS
-# ==============================
+# ══════════════════════════════════════════════════════════════
+# HEALTH CHECK
+# ══════════════════════════════════════════════════════════════
+@app.get("/")
+def root():
+    return {
+        "status":   "online",
+        "service":  "AI Backend v5",
+        "firebase": "connected" if db is not None else "❌ NOT connected",
+        "stripe":   "configured" if stripe.api_key else "❌ NOT configured",
+        "anthropic":"configured" if ANTHROPIC_API_KEY else "❌ NOT configured",
+    }
 
+
+@app.get("/ping")
+def ping():
+    return {"status": "alive"}
+
+
+# ══════════════════════════════════════════════════════════════
+# NOTIFICATION ENDPOINTS
+# ══════════════════════════════════════════════════════════════
 class NewProposalNotificationRequest(BaseModel):
     clientId:       str
     freelancerId:   str
@@ -152,7 +226,7 @@ class ProposalStatusNotificationRequest(BaseModel):
     clientId:     str
     jobId:        str
     jobTitle:     str
-    status:       str   # "accepted" or "rejected"
+    status:       str
     proposalId:   str = ""
 
 
@@ -177,7 +251,7 @@ async def notify_new_proposal(req: NewProposalNotificationRequest):
             job_id=req.jobId,
             proposal_id=req.proposalId,
         )
-        return JSONResponse(content={"status": "success", "message": "Client notified."})
+        return JSONResponse(content={"status": "success"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -195,16 +269,14 @@ async def notify_proposal_status(req: ProposalStatusNotificationRequest):
             job_id=req.jobId,
             proposal_id=req.proposalId,
         )
-        return JSONResponse(content={"status": "success", "message": "Freelancer notified."})
+        return JSONResponse(content={"status": "success"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/notify/advance-payment")
 async def notify_advance_payment(req: PaymentNotifyRequest):
-    """Called from Flutter after advance payment succeeds."""
     try:
-        # Notify freelancer
         await send_notification(
             user_id=req.freelancerId,
             sender_id="system",
@@ -214,7 +286,6 @@ async def notify_advance_payment(req: PaymentNotifyRequest):
             job_id=req.jobId,
             proposal_id=req.proposalId,
         )
-        # Notify client
         await send_notification(
             user_id=req.clientId,
             sender_id="system",
@@ -229,12 +300,11 @@ async def notify_advance_payment(req: PaymentNotifyRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==============================
-# ★ STRIPE — Create Payment Intent
-# ==============================
-
+# ══════════════════════════════════════════════════════════════
+# STRIPE — Create Payment Intent
+# ══════════════════════════════════════════════════════════════
 class CreatePaymentIntentRequest(BaseModel):
-    amount:       float        # in USD e.g. 100.0
+    amount:       float
     currency:     str = "usd"
     freelancerId: str = ""
     jobTitle:     str = ""
@@ -242,15 +312,14 @@ class CreatePaymentIntentRequest(BaseModel):
 
 @app.post("/create-payment-intent")
 async def create_payment_intent(req: CreatePaymentIntentRequest):
-    """
-    Called from Flutter before showing Stripe payment sheet.
-    Returns clientSecret which Flutter uses to complete payment.
-    """
     try:
         if not stripe.api_key:
-            raise HTTPException(status_code=500, detail="Stripe not configured — set STRIPE_SECRET_KEY in Railway")
+            raise HTTPException(
+                status_code=500,
+                detail="Stripe not configured — add STRIPE_SECRET_KEY to Railway"
+            )
 
-        amount_cents = int(req.amount * 100)  # Stripe works in cents
+        amount_cents = int(req.amount * 100)
 
         intent = stripe.PaymentIntent.create(
             amount=amount_cents,
@@ -277,20 +346,14 @@ async def create_payment_intent(req: CreatePaymentIntentRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==============================
-# ★ STRIPE — Webhook
-# ==============================
-
+# ══════════════════════════════════════════════════════════════
+# STRIPE — Webhook
+# ══════════════════════════════════════════════════════════════
 @app.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
-    """
-    Stripe calls this URL automatically after every payment event.
-    Flutter does NOT call this — Stripe does directly.
-    """
     payload    = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
-    # Verify the request is genuinely from Stripe
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, STRIPE_WEBHOOK_SECRET
@@ -299,65 +362,62 @@ async def stripe_webhook(request: Request):
         logger.error("❌ Invalid Stripe webhook signature")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    # ── Payment Succeeded ──────────────────────────────────────
+    _db = get_db()
+
     if event["type"] == "payment_intent.succeeded":
-        intent             = event["data"]["object"]
-        payment_intent_id  = intent["id"]
-        amount_paid        = intent["amount"] / 100
-        freelancer_id      = intent["metadata"].get("freelancerId", "")
-        job_title          = intent["metadata"].get("jobTitle", "")
+        intent            = event["data"]["object"]
+        payment_intent_id = intent["id"]
+        amount_paid       = intent["amount"] / 100
+        freelancer_id     = intent["metadata"].get("freelancerId", "")
+        job_title         = intent["metadata"].get("jobTitle", "")
 
         logger.info(f"✅ Payment confirmed: {payment_intent_id} — ${amount_paid}")
 
-        # Update Firestore payment record to confirmed
-        payments = db.collection("payments")
-        query    = payments.where("paymentIntentId", "==", payment_intent_id).limit(1).get()
+        query = _db.collection("payments").where(
+            "paymentIntentId", "==", payment_intent_id
+        ).limit(1).get()
         for doc in query:
             doc.reference.update({
                 "status":      "confirmed",
                 "confirmedAt": firestore.SERVER_TIMESTAMP,
             })
 
-        # Notify freelancer via Firestore + FCM
         if freelancer_id:
             await send_notification(
                 user_id=freelancer_id,
                 sender_id="system",
                 notification_type="advance_payment",
                 title="Payment Confirmed 💰",
-                message=f"${amount_paid:.2f} advance confirmed for \"{job_title}\"",
+                message=f"${amount_paid:.2f} confirmed for \"{job_title}\"",
             )
 
-    # ── Payment Failed ─────────────────────────────────────────
     elif event["type"] == "payment_intent.payment_failed":
         intent            = event["data"]["object"]
         payment_intent_id = intent["id"]
         logger.warning(f"❌ Payment failed: {payment_intent_id}")
 
-        payments = db.collection("payments")
-        query    = payments.where("paymentIntentId", "==", payment_intent_id).limit(1).get()
+        query = _db.collection("payments").where(
+            "paymentIntentId", "==", payment_intent_id
+        ).limit(1).get()
         for doc in query:
             doc.reference.update({"status": "failed"})
 
-    # ── Refund ─────────────────────────────────────────────────
     elif event["type"] == "charge.refunded":
-        charge = event["data"]["object"]
-        logger.info(f"💸 Refund processed: {charge['id']}")
+        logger.info(f"💸 Refund: {event['data']['object']['id']}")
 
     return JSONResponse(content={"status": "received"})
 
 
-# ==============================
-# ★ CHATBOT (Claude / Anthropic)
-# ==============================
-
+# ══════════════════════════════════════════════════════════════
+# CHATBOT — Claude / Anthropic
+# ══════════════════════════════════════════════════════════════
 CHATBOT_SYSTEM = """You are a helpful in-app assistant for a freelancing platform called FreelancerApp.
 Help users with: finding jobs, writing proposals, understanding platform features, general freelancing advice.
 Be concise, warm, and professional. Keep responses under 150 words unless more detail is truly needed."""
 
 
 class ChatMessage(BaseModel):
-    role:    str   # "user" | "assistant"
+    role:    str
     content: str
 
 
@@ -369,11 +429,13 @@ class ChatbotRequest(BaseModel):
 
 @app.post("/chatbot")
 async def chatbot(req: ChatbotRequest):
-    """Powered by Claude (Anthropic)."""
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages list is empty")
     if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured on server")
+        raise HTTPException(
+            status_code=500,
+            detail="ANTHROPIC_API_KEY not configured — add it to Railway"
+        )
 
     payload = {
         "model":      "claude-sonnet-4-20250514",
@@ -397,22 +459,21 @@ async def chatbot(req: ChatbotRequest):
     data       = res.json()
     reply_text = data["content"][0]["text"]
 
-    # Save in-app notification to Firestore
     if req.user_id:
         try:
-            db.collection("notifications").add({
+            _db = get_db()
+            _db.collection("notifications").add({
                 "userId":    req.user_id,
                 "senderId":  "chatbot",
                 "type":      "chatbot_reply",
                 "title":     "AI Assistant",
                 "message":   reply_text[:200],
-                "read":      False,
+                "isRead":    False,
                 "createdAt": firestore.SERVER_TIMESTAMP,
             })
         except Exception as e:
             logger.warning(f"Could not save chatbot notification: {e}")
 
-    # Send FCM push
     if req.fcm_token:
         preview = reply_text[:100] + ("…" if len(reply_text) > 100 else "")
         await _push_fcm(
@@ -425,10 +486,9 @@ async def chatbot(req: ChatbotRequest):
     return {"reply": reply_text, "usage": data.get("usage", {})}
 
 
-# ==============================
+# ══════════════════════════════════════════════════════════════
 # MCQ SECTION
-# ==============================
-
+# ══════════════════════════════════════════════════════════════
 class QueryRequest(BaseModel):
     message: str
 
@@ -464,16 +524,14 @@ def chat_endpoint(request: QueryRequest):
     return {"response": result}
 
 
-# ==============================
-# ID VERIFICATION SECTION
-# ==============================
-
+# ══════════════════════════════════════════════════════════════
+# ID VERIFICATION
+# ══════════════════════════════════════════════════════════════
 def save_upload(upload: UploadFile, suffix: str = ".jpg") -> Path:
     filename = f"{uuid.uuid4().hex}{suffix}"
     dest = UPLOAD_DIR / filename
     with dest.open("wb") as f:
         shutil.copyfileobj(upload.file, f)
-    logger.info(f"Saved: {dest} ({dest.stat().st_size} bytes)")
     return dest
 
 
@@ -501,7 +559,7 @@ def is_valid_image(path: Path) -> tuple:
         return False, "File not found."
     size_kb = path.stat().st_size / 1024
     if size_kb < 5:
-        return False, f"Image too small ({size_kb:.1f}KB). Please retake clearly."
+        return False, f"Image too small ({size_kb:.1f}KB)."
     try:
         img = load_image_rgb(path)
         h, w = img.shape[:2]
@@ -516,7 +574,11 @@ def preprocess_for_id(image_rgb: np.ndarray) -> np.ndarray:
     h, w = image_rgb.shape[:2]
     if w < 1200:
         scale     = 1200 / w
-        image_rgb = cv2.resize(image_rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+        image_rgb = cv2.resize(
+            image_rgb,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_CUBIC,
+        )
     kernel    = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
     bgr       = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     sharpened = cv2.filter2D(bgr, -1, kernel)
@@ -526,7 +588,11 @@ def preprocess_for_id(image_rgb: np.ndarray) -> np.ndarray:
 def get_face_encoding(image_rgb: np.ndarray, label: str = "image"):
     processed = preprocess_for_id(image_rgb)
     for upsample in [2, 1, 0]:
-        locs = face_recognition.face_locations(processed, number_of_times_to_upsample=upsample, model="hog")
+        locs = face_recognition.face_locations(
+            processed,
+            number_of_times_to_upsample=upsample,
+            model="hog",
+        )
         if locs:
             break
     if not locs:
@@ -537,16 +603,6 @@ def get_face_encoding(image_rgb: np.ndarray, label: str = "image"):
     if not encs:
         return None, f"Could not encode face in {label}."
     return encs[0], None
-
-
-@app.get("/")
-def root():
-    return {"status": "online", "service": "AI Backend v5"}
-
-
-@app.get("/ping")
-def ping():
-    return {"status": "alive"}
 
 
 @app.post("/verify-front-id")
@@ -580,15 +636,18 @@ async def verify_id(
         for path, label in [(selfie_path, "selfie"), (front_path, "front ID")]:
             valid, reason = is_valid_image(path)
             if not valid:
-                return JSONResponse(content={"status": "failed", "reason": f"{label.capitalize()} issue: {reason}"})
+                return JSONResponse(content={
+                    "status": "failed",
+                    "reason": f"{label.capitalize()} issue: {reason}",
+                })
 
         selfie_enc, _ = get_face_encoding(load_image_rgb(selfie_path), "selfie")
         if selfie_enc is None:
-            return JSONResponse(content={"status": "failed", "reason": "No face detected in selfie."})
+            return JSONResponse(content={"status": "failed", "reason": "No face in selfie."})
 
         id_enc, _ = get_face_encoding(load_image_rgb(front_path), "ID card")
         if id_enc is None:
-            return JSONResponse(content={"status": "failed", "reason": "No face found on ID card."})
+            return JSONResponse(content={"status": "failed", "reason": "No face on ID card."})
 
         distance   = face_recognition.face_distance([id_enc], selfie_enc)[0]
         matched    = bool(distance <= FACE_MATCH_TOLERANCE)
@@ -600,8 +659,18 @@ async def verify_id(
         )
 
         if matched:
-            return JSONResponse(content={"status": "verified", "distance": round(float(distance), 4), "confidence": confidence, "message": "Identity verified successfully."})
-        return JSONResponse(content={"status": "failed", "reason": "Face does not match ID photo.", "distance": round(float(distance), 4), "confidence": confidence})
+            return JSONResponse(content={
+                "status":     "verified",
+                "distance":   round(float(distance), 4),
+                "confidence": confidence,
+                "message":    "Identity verified successfully.",
+            })
+        return JSONResponse(content={
+            "status":     "failed",
+            "reason":     "Face does not match ID photo.",
+            "distance":   round(float(distance), 4),
+            "confidence": confidence,
+        })
 
     except Exception as e:
         logger.error(f"/verify-id error: {e}", exc_info=True)
@@ -610,10 +679,9 @@ async def verify_id(
         cleanup(selfie_path, front_path, back_path)
 
 
-# ==============================
-# JOB RECOMMENDATION SECTION
-# ==============================
-
+# ══════════════════════════════════════════════════════════════
+# JOB RECOMMENDATION
+# ══════════════════════════════════════════════════════════════
 @app.post("/recommend-jobs")
 async def recommend_jobs(request: Request):
     try:
@@ -656,7 +724,7 @@ Rules: match_score >= 50 only, max 10 jobs, sort descending, reason < 20 words."
             if ai_raw.startswith("json"):
                 ai_raw = ai_raw[4:]
 
-        matched = json.loads(ai_raw.strip())
+        matched     = json.loads(ai_raw.strip())
         recommended = []
         for item in matched:
             idx = item.get("job_index")
@@ -668,24 +736,30 @@ Rules: match_score >= 50 only, max 10 jobs, sort descending, reason < 20 words."
             recommended.append(job)
 
         recommended.sort(key=lambda x: x.get("match_score", 0), reverse=True)
-        return JSONResponse(content={"status": "success", "recommended_jobs": recommended, "total": len(recommended)})
+        return JSONResponse(content={
+            "status":           "success",
+            "recommended_jobs": recommended,
+            "total":            len(recommended),
+        })
 
     except json.JSONDecodeError:
         fallback = [dict(j) for j in jobs[:10]]
         for j in fallback:
             j["match_score"] = 0
             j["reason"]      = "Keyword-based fallback"
-        return JSONResponse(content={"status": "success", "recommended_jobs": fallback, "total": len(fallback)})
-
+        return JSONResponse(content={
+            "status":           "success",
+            "recommended_jobs": fallback,
+            "total":            len(fallback),
+        })
     except Exception as e:
         logger.error(f"/recommend-jobs error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==============================
-# PROPOSAL GENERATION SECTION
-# ==============================
-
+# ══════════════════════════════════════════════════════════════
+# PROPOSAL GENERATION
+# ══════════════════════════════════════════════════════════════
 class ProposalRequest(BaseModel):
     prompt: str
 
@@ -707,11 +781,10 @@ async def generate_proposal(request: ProposalRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==============================
+# ══════════════════════════════════════════════════════════════
 # RUN
-# ==============================
-
+# ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True) 
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
